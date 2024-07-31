@@ -24,7 +24,6 @@ const updateWarning = `!!!!!!!!!!
 
 const configHeader = `# %s configuration
 # 
-# This config has https://github.com/schachmat/ingo syntax.
 # Empty lines or lines starting with # will be ignored.
 # All other lines must look like "KEY=VALUE" (without the quotes).
 # The VALUE must not be enclosed in quotes as well!
