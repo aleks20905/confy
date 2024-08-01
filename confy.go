@@ -1,3 +1,5 @@
+// Package confy provides a drop-in replacement for flag.Parse() with flags
+// persisted in a user editable configuration file.
 package confy
 
 import (
@@ -6,11 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
 	"os"
 	"os/user"
-	"path/filepath"
+	"path"
 	"strings"
 	"unicode/utf8"
 )
@@ -21,7 +21,6 @@ const updateWarning = `!!!!!!!!!!
 ! and remove the last "deprecated" paragraph to disable this message!
 !!!!!!!!!!
 `
-
 const configHeader = `# %s configuration
 # 
 # Empty lines or lines starting with # will be ignored.
@@ -31,34 +30,41 @@ const configHeader = `# %s configuration
 
 var openOrCreate = os.OpenFile
 
-// Parse should be called by the user instead of `flag.Parse()` after all flags
-
 func Parse(appName string) error {
 	if flag.Parsed() {
 		return fmt.Errorf("flags have been parsed already")
 	}
 
-	cPath, err := getConfigFilePath(appName)
+	cPath, err := getConfigPath(appName)
 	if err != nil {
 		return err
 	}
 
-	oldConf, err := ioutil.ReadFile(cPath)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("unable to read %s config file %v: %v", appName, cPath, err)
+	cf, err := openOrCreate(cPath, os.O_RDWR|os.O_CREATE, 0666)
+	if err != nil {
+		return fmt.Errorf("unable to open %s config file %v for reading and writing: %v", appName, cPath, err)
 	}
+	defer cf.Close()
 
-	obsoleteKeys := parseConfig(bytes.NewReader(oldConf))
+	// read config to buffer and parse
+	oldConf := new(bytes.Buffer)
+	obsoleteKeys := parseConfig(io.TeeReader(cf, oldConf))
 	if len(obsoleteKeys) > 0 {
-		log.Printf(updateWarning, appName, cPath)
+		fmt.Fprintf(os.Stderr, updateWarning, appName, cPath)
 	}
 
+	// write updated config to another buffer
 	newConf := new(bytes.Buffer)
 	fmt.Fprintf(newConf, configHeader, appName)
 	saveConfig(newConf, obsoleteKeys)
 
-	if !bytes.Equal(oldConf, newConf.Bytes()) {
-		if err := ioutil.WriteFile(cPath, newConf.Bytes(), 0666); err != nil {
+	// only write the file if it changed
+	if !bytes.Equal(oldConf.Bytes(), newConf.Bytes()) {
+		if ofs, err := cf.Seek(0, 0); err != nil || ofs != 0 {
+			return fmt.Errorf("failed to seek to beginning of %s: %v", cPath, err)
+		} else if err = cf.Truncate(0); err != nil {
+			return fmt.Errorf("failed to truncate %s: %v", cPath, err)
+		} else if _, err = newConf.WriteTo(cf); err != nil {
 			return fmt.Errorf("failed to write %s: %v", cPath, err)
 		}
 	}
@@ -67,7 +73,7 @@ func Parse(appName string) error {
 	return nil
 }
 
-func getConfigFilePath(appName string) (string, error) {
+func getConfigPath(appName string) (string, error) {
 	envname := strings.ToUpper(appName) + "INF0"
 	cPath := os.Getenv(envname)
 	if cPath == "" {
@@ -75,7 +81,7 @@ func getConfigFilePath(appName string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("%v\nYou can set the environment variable %s to point to your config file as a workaround", err, envname)
 		}
-		cPath = filepath.Join(usr.HomeDir, "."+strings.ToLower(appName)+"inf0")
+		cPath = path.Join(usr.HomeDir, "."+strings.ToLower(appName)+"inf0")
 	}
 	return cPath, nil
 }
@@ -89,6 +95,7 @@ func parseConfig(r io.Reader) map[string]string {
 			continue
 		}
 
+		// find first assignment symbol and parse key, val
 		i := strings.IndexAny(line, "=:")
 		if i == -1 {
 			continue
@@ -97,12 +104,15 @@ func parseConfig(r io.Reader) map[string]string {
 
 		if err := flag.Set(key, val); err != nil {
 			obsKeys[key] = val
+			continue
 		}
 	}
 	return obsKeys
 }
 
 func saveConfig(w io.Writer, obsKeys map[string]string) {
+	// find flags pointing to the same variable. We will only write the longest
+	// named flag to the config file, the shorthand version is ignored.
 	deduped := make(map[flag.Value]flag.Flag)
 	flag.VisitAll(func(f *flag.Flag) {
 		if cur, ok := deduped[f.Value]; !ok || utf8.RuneCountInString(f.Name) > utf8.RuneCountInString(cur.Name) {
@@ -118,7 +128,9 @@ func saveConfig(w io.Writer, obsKeys map[string]string) {
 		}
 	})
 
-	if len(obsKeys) > 0 {
+	// if we have obsolete keys left from the old config, preserve them in an
+	// additional section at the end of the file
+	if obsKeys != nil && len(obsKeys) > 0 {
 		fmt.Fprintln(w, "\n\n# The following options are probably deprecated and not used currently!")
 		for key, val := range obsKeys {
 			fmt.Fprintf(w, "%v=%v\n", key, val)
